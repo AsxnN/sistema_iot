@@ -1,0 +1,304 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <DHT.h>
+#include <SPI.h>
+#include <SD.h>
+#include "time.h"  // Para fecha/hora NTP
+
+// ========== PINES SENSORES ==========
+#define PIN_NIVEL1 2
+#define PIN_NIVEL2 3
+#define PIN_NIVEL3 4
+#define PIN_TDS A0
+#define DHTPIN 9
+#define DHTTYPE DHT11
+#define SD_CS 10
+
+// ========== PINES LEDs Y BUZZER ==========
+#define LED_VERDE 7
+#define LED_AMARILLO 6
+#define LED_ROJO 5
+#define BUZZER 8
+
+// ========== RANGOS ==========
+#define TEMP_PELIGRO_BAJO 15.0
+#define TEMP_ALERTA_BAJO 19.9
+#define TEMP_OPTIMO_BAJO 20.0
+#define TEMP_OPTIMO_ALTO 29.0
+#define TEMP_ALERTA_ALTO 30.0
+#define TEMP_PELIGRO_ALTO 33.0
+
+#define TDS_OPTIMO_BAJO 100
+#define TDS_OPTIMO_ALTO 300
+#define TDS_ALERTA_BAJO 301
+#define TDS_ALERTA_ALTO 500
+#define TDS_ALERTA_ALTA_BAJO 501
+#define TDS_ALERTA_ALTA_ALTO 1000
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+DHT dht(DHTPIN, DHTTYPE);
+
+byte pantalla = 0;
+unsigned long ultimoCambio = 0;
+unsigned long ultimaLectura = 0;
+bool sdOk = false;
+
+String horaRecibida = "00:00:00";
+
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(LED_VERDE, OUTPUT);
+  pinMode(LED_AMARILLO, OUTPUT);
+  pinMode(LED_ROJO, OUTPUT);
+  pinMode(BUZZER, OUTPUT);
+  pinMode(PIN_NIVEL1, INPUT_PULLUP);
+  pinMode(PIN_NIVEL2, INPUT_PULLUP);
+  pinMode(PIN_NIVEL3, INPUT_PULLUP);
+
+  digitalWrite(LED_VERDE, LOW);
+  digitalWrite(LED_AMARILLO, LOW);
+  digitalWrite(LED_ROJO, LOW);
+
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.print("Sistema Activo");
+
+  dht.begin();
+
+  // Configurar NTP (usa hora del ESP32 por serial como fallback)
+  // configTime(-5 * 3600, 0, "pool.ntp.org");  // Desactivado - usa hora ESP32
+
+  delay(100);
+  if (!SD.begin(SD_CS)) {
+    Serial.println(F("[ERROR] SD no detectada"));
+    sdOk = false;
+  } else {
+    sdOk = true;
+    Serial.println(F("[OK] SD inicializada"));
+    if (!SD.exists("datos.csv")) {
+      File f = SD.open("datos.csv", FILE_WRITE);
+      if (f) {
+        f.println(F("Time,Nivel,B1,B2,B3,Temp,Hum,TDS,TDS_Raw,Estado_Temp,Estado_TDS"));
+        f.close();
+        Serial.println(F("[OK] Archivo datos.csv creado"));
+      }
+    }
+  }
+
+  delay(2000);
+  lcd.clear();
+}
+
+void loop() {
+  unsigned long t = millis();
+
+  leerHoraSerial();
+
+  if (t - ultimaLectura >= 2000) {
+    ultimaLectura = t;
+
+    byte b1 = digitalRead(PIN_NIVEL1);
+    byte b2 = digitalRead(PIN_NIVEL2);
+    byte b3 = digitalRead(PIN_NIVEL3);
+
+    byte nivel = 0;
+    if (b1 == LOW && b2 == LOW && b3 == LOW) nivel = 1;
+    else if (b1 == LOW && b2 == LOW) nivel = 2;
+    else if (b1 == LOW) nivel = 3;
+
+    float temp = dht.readTemperature();
+    float hum = dht.readHumidity();
+
+    if (isnan(temp)) temp = 0;
+    if (isnan(hum)) hum = 0;
+
+    int tdsRaw = analogRead(PIN_TDS);
+    float v = tdsRaw * (5.0 / 1024.0);
+    int tds = (int)((133.42 * v * v * v - 255.86 * v * v + 857.39 * v) * 0.5);
+
+    byte eTemp = getEstadoTemp(temp);
+    byte eTDS = getEstadoTDS(tds);
+
+    controlLEDs(nivel);
+
+    if (sdOk) {
+      guardarDatos(t, nivel, b1, b2, b3, temp, hum, tds, tdsRaw, eTemp, eTDS);
+    }
+
+    enviarJSON(nivel, temp, eTemp, hum, tds, eTDS);
+
+    actualizarLCDConHora(nivel, temp, hum, tds, eTemp, eTDS);
+  }
+
+  if (t - ultimoCambio >= 3000) {
+    ultimoCambio = t;
+    pantalla = (pantalla + 1) % 4;  // 4 pantallas rotativas
+  }
+}
+
+void leerHoraSerial() {
+  while (Serial.available()) {
+    String linea = Serial.readStringUntil('\n');
+    if (linea.startsWith("HORA:")) {
+      horaRecibida = linea.substring(5);
+      horaRecibida.trim();
+    }
+  }
+}
+
+void actualizarLCDConHora(byte n, float t, float h, int tds, byte eT, byte eTDS) {
+  lcd.clear();
+
+  if (pantalla == 0) {
+    // Pantalla 1: FECHA COMPLETA (usa fecha actual del sistema)
+    lcd.setCursor(0, 0);
+    lcd.print(F("Fecha:05/12/2025"));  // Fecha fija por ahora
+    lcd.setCursor(0, 1);
+    lcd.print(F("Ribera Norte"));
+    
+  } else if (pantalla == 1) {
+    // Pantalla 2: Nivel y Temperatura
+    lcd.setCursor(0, 0);
+    lcd.print(F("Niv:"));
+    lcd.print(getNivelTexto(n));
+    lcd.setCursor(0, 1);
+    lcd.print(F("T:"));
+    lcd.print(t, 1);
+    lcd.print(F("C "));
+    lcd.print(getNombreEstadoTemp(eT));
+    
+  } else if (pantalla == 2) {
+    // Pantalla 3: Hora + TDS
+    lcd.setCursor(0, 0);
+    lcd.print(F("Hora:"));
+    lcd.print(horaRecibida);
+    
+    lcd.setCursor(0, 1);
+    lcd.print(F("TDS:"));
+    lcd.print(tds);
+    lcd.print(F(" ppm"));
+    
+  } else {
+    // Pantalla 4: Humedad + Estado general
+    lcd.setCursor(0, 0);
+    lcd.print(F("H:"));
+    lcd.print((int)h);
+    lcd.print(F("% TDS:"));
+    if (eTDS == 1) lcd.print(F("Optimo"));
+    else if (eTDS == 2) lcd.print(F("Alerta"));
+    else lcd.print(F("Peligro"));
+    
+    lcd.setCursor(0, 1);
+    lcd.print(F("Agua:"));
+    lcd.print(getNivelTexto(n));
+    if (eT == 3 && (eTDS <= 1)) lcd.print(F(" OK"));
+    else if (eT == 1 || eT == 5 || eTDS == 4) lcd.print(F("!!"));
+    else lcd.print(F("!"));
+  }
+}
+
+byte getEstadoTemp(float t) {
+  if (t == 0) return 0;
+  if (t < TEMP_PELIGRO_BAJO) return 1;
+  if (t <= TEMP_ALERTA_BAJO) return 2;
+  if (t >= TEMP_OPTIMO_BAJO && t <= TEMP_OPTIMO_ALTO) return 3;
+  if (t >= TEMP_ALERTA_ALTO && t <= TEMP_PELIGRO_ALTO) return 4;
+  return 5;
+}
+
+byte getEstadoTDS(int tds) {
+  if (tds < TDS_OPTIMO_BAJO) return 0;
+  if (tds <= TDS_OPTIMO_ALTO) return 1;
+  if (tds <= TDS_ALERTA_ALTO) return 2;
+  if (tds <= TDS_ALERTA_ALTA_ALTO) return 3;
+  return 4;
+}
+
+void controlLEDs(byte nivel) {
+  digitalWrite(LED_VERDE, LOW);
+  digitalWrite(LED_AMARILLO, LOW);
+  digitalWrite(LED_ROJO, LOW);
+  noTone(BUZZER);
+  
+  switch (nivel) {
+    case 0: break;
+    case 1: digitalWrite(LED_ROJO, HIGH); tone(BUZZER, 2000, 300); break;
+    case 2: digitalWrite(LED_AMARILLO, HIGH); tone(BUZZER, 1500, 200); break;
+    case 3: digitalWrite(LED_VERDE, HIGH); tone(BUZZER, 1000, 100); break;
+  }
+}
+
+void guardarDatos(unsigned long t, byte n, byte b1, byte b2, byte b3, float temp, float hum, int tds, int raw, byte eT, byte eTDS) {
+  File f = SD.open("datos.csv", FILE_WRITE);
+  if (f) {
+    f.print(t); f.print(',');
+    f.print(n); f.print(',');
+    f.print(b1 == LOW ? 1 : 0); f.print(',');
+    f.print(b2 == LOW ? 1 : 0); f.print(',');
+    f.print(b3 == LOW ? 1 : 0); f.print(',');
+    f.print(temp); f.print(',');
+    f.print(hum); f.print(',');
+    f.print(tds); f.print(',');
+    f.print(raw); f.print(',');
+    f.print(eT); f.print(',');
+    f.println(eTDS);
+    f.close();
+    Serial.println(F("[SD] OK"));
+  } else {
+    Serial.println(F("[SD] ERROR"));
+    sdOk = false;
+  }
+}
+
+void enviarJSON(byte n, float t, byte eT, float h, int tds, byte eTDS) {
+  Serial.print(F("{\"nivel\":"));
+  Serial.print(n);
+  Serial.print(F(",\"estado_nivel\":\""));
+  Serial.print(getNivelTexto(n));
+  Serial.print(F("\",\"temperatura\":"));
+  Serial.print(t, 1);
+  Serial.print(F(",\"estado_temp\":\""));
+  Serial.print(getNombreEstadoTemp(eT));
+  Serial.print(F("\",\"humedad\":"));
+  Serial.print(h, 1);
+  Serial.print(F(",\"tds\":"));
+  Serial.print(tds);
+  Serial.print(F(",\"estado_tds\":\""));
+  Serial.print(getNombreEstadoTDS(eTDS));
+  Serial.println(F("\"}"));
+}
+
+const char* getNombreEstadoTemp(byte e) {
+  switch (e) {
+    case 0: return "Sin datos";
+    case 1: return "Peligro(Baja)";
+    case 2: return "Alerta(Baja)";
+    case 3: return "Optimo";
+    case 4: return "Alerta(Alta)";
+    case 5: return "Peligro(Alto)";
+    default: return "";
+  }
+}
+
+const char* getNombreEstadoTDS(byte e) {
+  switch (e) {
+    case 0: return "Muy optimo";
+    case 1: return "Optimo";
+    case 2: return "Alerta Leve";
+    case 3: return "Alerta Alta";
+    case 4: return "Peligro";
+    default: return "";
+  }
+}
+
+const char* getNivelTexto(byte n) {
+  switch (n) {
+    case 0: return "SIN AGUA";
+    case 1: return "DESBORDANDO";
+    case 2: return "OPTIMO";
+    case 3: return "BAJO";
+    default: return "";
+  }
+}
