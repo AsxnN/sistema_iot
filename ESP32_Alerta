@@ -1,0 +1,132 @@
+#include <WiFi.h>
+#include <LiquidCrystal_I2C.h>
+#include "time.h"
+
+const char* ssid = "Task";
+const char* password = "2demayo1265";
+
+WiFiServer server(80);
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+const int buzzerPin = 4;
+
+bool alertaActiva = false;
+unsigned long tiempoInicioAlerta = 0;
+const unsigned long duracionAlerta = 60000;
+
+unsigned long ultimaActualizacionHora = 0;
+const unsigned long intervaloHora = 1000;
+
+unsigned long ultimoCambio = 0;
+byte pantalla = 0;
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(buzzerPin, OUTPUT);
+  digitalWrite(buzzerPin, LOW);
+
+  lcd.init();
+  lcd.backlight();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  Serial.print("Conectando WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi conectado");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+
+  server.begin();
+
+  configTime(-5 * 3600, 0, "pool.ntp.org");
+
+  mostrarEstadoNormal();
+}
+
+void loop() {
+  WiFiClient client = server.available();
+  if (client) {
+    String request = client.readStringUntil('\r');
+    Serial.print("Request: ");
+    Serial.println(request);
+    client.flush();
+
+    if (request.indexOf("GET /alerta") >= 0) {
+      activarAlerta();
+      client.println("HTTP/1.1 200 OK");
+      client.println("Content-Type: text/plain");
+      client.println("Connection: close");
+      client.println();
+      client.println("Alerta recibida");
+    } else {
+      client.println("HTTP/1.1 404 Not Found");
+      client.println("Connection: close");
+      client.println();
+    }
+    delay(1);
+    client.stop();
+    Serial.println("Cliente desconectado");
+  }
+
+  if (alertaActiva && millis() - tiempoInicioAlerta > duracionAlerta) {
+    alertaActiva = false;
+    apagarAlerta();
+  }
+
+  if (!alertaActiva && millis() - ultimaActualizacionHora >= intervaloHora) {
+    ultimaActualizacionHora = millis();
+
+    if (pantalla == 0) mostrarEstadoNormal();
+    else if (pantalla == 1) mostrarHoraLCD();
+
+    if (millis() - ultimoCambio >= 10000) {
+      ultimoCambio = millis();
+      pantalla = (pantalla + 1) % 2;
+    }
+  }
+}
+
+void activarAlerta() {
+  alertaActiva = true;
+  tiempoInicioAlerta = millis();
+
+  Serial.println("¡Alerta de desbordamiento nivel 1!");
+
+  digitalWrite(buzzerPin, HIGH);
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("ALERTA INUNDACION");
+  lcd.setCursor(0, 1);
+  lcd.print("C: Ribera Norte");
+}
+
+void apagarAlerta() {
+  digitalWrite(buzzerPin, LOW);
+  mostrarEstadoNormal();
+}
+
+void mostrarEstadoNormal() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Estado: Normal");
+}
+
+void mostrarHoraLCD() {
+  lcd.clear();
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    lcd.setCursor(0, 0);
+    lcd.print("Hora no disponible");
+  } else {
+    char timeStr[16];
+    strftime(timeStr, sizeof(timeStr), "Hora: %H:%M:%S", &timeinfo);
+    lcd.setCursor(0, 0);
+    lcd.print(timeStr);
+    lcd.setCursor(0, 1);
+    lcd.print("Fecha: 05/12/25");
+  }
+}
